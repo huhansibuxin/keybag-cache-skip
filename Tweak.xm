@@ -36,11 +36,13 @@
 #import <stdarg.h>
 
 // ---- diagnostic log (temporary, for on-device verification) -----------------
-// keybagd launches on demand and idle-exits, so this only appends a few lines
-// per day. It lets us confirm: (a) the dylib was loaded into keybagd, and
-// (b) whether the hook armed or the prologue guard bailed. Remove once verified.
+// keybagd runs with the REAL root view and has no writable /tmp, but it writes
+// its own log to /var/logs, so we log there (same dir, same filesystem view).
+// It lets us confirm: (a) the dylib was loaded into keybagd, (b) whether the
+// hook armed or the prologue guard bailed, and (c) that the replacement actually
+// fires on a real launch. Remove once verified.
 static void kcs_log(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/keybagcacheskip.log", "a");
+    FILE *f = fopen("/var/logs/keybagcacheskip.log", "a");
     if (!f) return;
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fprintf(f, "\n");
@@ -63,7 +65,10 @@ static void *(*orig_drain_backup_keys)(void) = NULL;
 // Replacement: never rebuild / never create the backup-keys cache.
 // Returning NULL makes the caller skip storing any cache handle; keybagd then
 // derives keys on demand. Backup is disabled, so this is a no-op feature-wise.
+// This function (0x1000167cc) also contains the 25s `db_check_once` of the
+// existing 306 MB cache db, so short-circuiting it kills the cold-boot spike.
 static void *replacement_drain_backup_keys(void) {
+    kcs_log("CALLED pid=%d -> returning NULL (skip cache check+rebuild)", getpid());
     return NULL;
 }
 
