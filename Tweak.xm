@@ -79,7 +79,6 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <libkern/OSCacheControl.h>
 #include <stdint.h>
@@ -254,9 +253,11 @@ static void kcs_bootstrap(void) {
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr3 = mach_vm_region(mach_task_self(), (mach_vm_address_t *)&qa, &qs,
-                                       VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
-                                       &icnt, &obj);
+    // NB: mach_vm_region() lives in <mach/mach_vm.h>, which the iOS SDK blocks
+    // with `#error mach_vm.h unsupported`. vm_region_64() is the usable flavour
+    // and is declared in <mach/vm_map.h> (pulled in by <mach/mach.h>).
+    kern_return_t kr3 = vm_region_64(mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&info, &icnt, &obj);
     unsigned prot = (kr3 == KERN_SUCCESS) ? (unsigned)info.protection : 0xFFFFFFFFu;
 
     kcs_log("KCS-PATCHED ok at %p bytes=%s page=%p ps=%ld prot=%#x (want 0x5=r-x)",
