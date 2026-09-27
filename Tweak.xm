@@ -86,7 +86,8 @@ static void *replacement_cache_fn(void) {
         return;
     }
 
-    void *oldfn = MSHookFunction(target, (void *)replacement_cache_fn,
-                                 (void **)&orig_cache_fn);
-    kcs_log("HOOKED ok target=%p slide=%#lx old=%p", target, (unsigned long)slide, oldfn);
+    MSHookFunction(target, (void *)replacement_cache_fn,
+                   (void **)&orig_cache_fn);
+    kcs_log("HOOKED ok target=%p slide=%#lx orig=%p", target, (unsigned long)slide,
+            (void *)orig_cache_fn);
 }
