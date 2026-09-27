@@ -65,6 +65,16 @@ jobs:
           fi
           echo "OK: substrate-free"
 
+      # v1.2.0 纯净断言：探针/日志代码已全部移除，产物里不得再出现任何诊断字符串。
+      - name: Verify dylib is instrumentation-free
+        run: |
+          DYLIB=$(find .theos -name 'KeybagCacheSkip.dylib' -type f | head -1)
+          if strings -a "$DYLIB" | grep -qE 'kcs_marker|KCS-|keybagcacheskip\.log'; then
+            echo "::error::diagnostic strings found in KeybagCacheSkip.dylib -> instrumentation crept back in"
+            exit 1
+          fi
+          echo "OK: instrumentation-free"
+
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:

@@ -23,6 +23,8 @@ KeybagCacheSkip_FILES = Tweak.xm
 # -lsubstrate（本源码已不使用 MSHookFunction/MSHookMessageEx/任何 substrate 符号）。
 # CI 里有一条 otool 断言，一旦 substrate 回来会直接 fail 构建。
 KeybagCacheSkip_LDFLAGS = -Wl,-dead_strip_dylibs
+# 体积优先：源码只有几百行，不含 ObjC/stdio（无任何文件 I/O），-Os 让产物尽可能小。
+KeybagCacheSkip_CFLAGS = -Os
 # 关掉 -Werror，避免小警告挂掉 CI（与 LocalStorageSkip / NIP 同款安全网）
 ERROR_ON_WARNINGS = 0
 
