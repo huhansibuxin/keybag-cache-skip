@@ -40,6 +40,27 @@
 // then compute the target. v7 also dumps the full image list to the marker so a
 // failure is diagnosable in one round trip.
 //
+// ---------------------------------------------------------------------------
+// v8 — WHY v7 PATCHED CORRECTLY BUT CRASHED keybagd (proven on device 2026-09-28)
+// ---------------------------------------------------------------------------
+// v7 found the right address and wrote the patch (marker: KCS-CAND[0] match=1,
+// KCS-PATCHED ok), but keybagd then entered a 10-second crash loop:
+//     exception : EXC_BAD_ACCESS / SIGBUS
+//     subtype   : KERN_PROTECTION_FAILURE at 0x1001bd864
+//     thread    : dyld `start` -> keybagd +0x15864        (main entry!)
+//     keybagd image base 0x1001a8000 + 0x15864 = 0x1001bd864  == the fault address
+// Cause: **iOS enforces W^X**. v7 left the patched page mapped RWX (we only ever
+// *added* WRITE; we never took it back). The instruction fetch that follows
+// faults, and because the target (0x167cc) shares its 16 KB page (0x14000-0x17FFF)
+// with main() (0x15864), the very first instruction of main() dies -- so keybagd
+// crashed at startup and launchd relaunched it every 10 s ("starts then exits
+// after a few seconds").
+//
+// Fix: restore the page to r-x (drop WRITE) IMMEDIATELY after memcpy, before any
+// instruction on that page is fetched; then flush the icache; then verify both
+// the written bytes and the region protection. If the restore fails we roll the
+// original bytes back rather than risk an RWX page.
+//
 // Patching @0x1000167cc = overwrite the prologue with:
 //     mov x0, #0     (0xD2800000)   ; return NULL
 //     ret            (0xD65F03C0)
@@ -52,11 +73,14 @@
 //   * db_check_once   emit          @0x100016854 / 0x100016878  (inside 0x1000167cc)
 //   * insert helper   @0x10000e7c0  (REPLACE INTO WrappedKeys VALUES(?,?,?,0))
 //   * rebuild loop    @0x1000169d0  (x20 += 0x7c stride, x26 = row counter)
+//   * main()          @0x100015864  (same 16 KB page as the target!)
 // ---------------------------------------------------------------------------
 
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>
+#import <mach/vm_region.h>
 #import <libkern/OSCacheControl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,10 +140,11 @@ static void kcs_bootstrap(void) {
     done = 1;
 
     uint32_t nimg = _dyld_image_count();
-    kcs_log("KCS-BOOT v7 pid=%d dynimages=%u", getpid(), nimg);
+    kcs_log("KCS-BOOT v8 pid=%d dynimages=%u", getpid(), nimg);
 
-    // Dump the image table (so one round trip is enough to diagnose).
-    for (uint32_t i = 0; i < nimg && i < 24; i++) {
+    // Brief image table (first few only -- the full dump was needed for v6/v7 and
+    // was blowing the marker file up to ~180 KB per launch).
+    for (uint32_t i = 0; i < nimg && i < 6; i++) {
         const struct mach_header *h = _dyld_get_image_header(i);
         const char *nm = _dyld_get_image_name(i);
         kcs_log("KCS-IMG[%u] type=%u slide=%#lx name=%s",
@@ -180,25 +205,62 @@ static void kcs_bootstrap(void) {
     }
     kcs_log("KCS-HIT at %p via %s", (void *)hit, hitname ? hitname : "?");
 
-    // Make the code page writable. VM_PROT_COPY gives us a COW private copy of
-    // the signed __TEXT page, which is what every inline hooker does on iOS.
+    // --- write the patch -------------------------------------------------------
     long ps = getpagesize();
     uintptr_t page = (uintptr_t)hit & ~((uintptr_t)ps - 1);
+
+    unsigned char orig[8];
+    memcpy(orig, hit, sizeof(orig));
+
+    // VM_PROT_COPY gives us a COW private copy of the signed __TEXT page, which
+    // is what every inline hooker does on iOS (the file mapping itself is not
+    // writable).
     kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)ps, FALSE,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
-        kcs_log("KCS-FAILED vm_protect kr=%d (page=%p)", kr, (void *)page);
+        kcs_log("KCS-FAILED vm_protect(rwx) kr=%d (page=%p)", kr, (void *)page);
         return;
     }
 
     memcpy(hit, kPatch, sizeof(kPatch));
+
+    // *** THE v7 CRASH FIX: iOS enforces W^X. ***
+    // Drop WRITE before ANY instruction on this page is fetched. The target
+    // (0x167cc) shares its 16 KB page with main() (0x15864), so leaving the page
+    // RWX made keybagd fault on main()'s first instruction (SIGBUS /
+    // KERN_PROTECTION_FAILURE) -> 10 s crash loop.
+    kern_return_t kr2 = vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)ps, FALSE,
+                                   VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr2 != KERN_SUCCESS) {
+        kcs_log("KCS-WX-FAILED restore r-x kr=%d -> rolling back", kr2);
+        vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)ps, FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        memcpy(hit, orig, sizeof(orig));
+        sys_icache_invalidate(hit, sizeof(orig));
+        vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)ps, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+        return;
+    }
     sys_icache_invalidate(hit, sizeof(kPatch));
 
+    // --- verify: bytes actually written + page protection is r-x (no W) --------
     unsigned char after[8];
     char hxa[24];
     memcpy(after, hit, sizeof(after));
     kcs_hex8(hxa, sizeof(hxa), after);
-    kcs_log("KCS-PATCHED ok at %p bytes=%s", (void *)hit, hxa);
+
+    vm_address_t qa = (vm_address_t)page;
+    vm_size_t qs = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr3 = mach_vm_region(mach_task_self(), (mach_vm_address_t *)&qa, &qs,
+                                       VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                                       &icnt, &obj);
+    unsigned prot = (kr3 == KERN_SUCCESS) ? (unsigned)info.protection : 0xFFFFFFFFu;
+
+    kcs_log("KCS-PATCHED ok at %p bytes=%s page=%p ps=%ld prot=%#x (want 0x5=r-x)",
+            (void *)hit, hxa, (void *)page, ps, prot);
 }
 
 %ctor { kcs_bootstrap(); }
