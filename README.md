@@ -68,8 +68,9 @@ Install the matching `.deb` with your package manager / TrollFools. After
 install, `keybagd` is killed so `launchd` relaunches it **without** the rebuild
 spike.
 
-> **Note (roothide):** install the `*-roothide.deb`. The Filter targets the
-> `keybagd` executable, so it only loads into that daemon.
+> **Note (roothide):** install the `*-roothide.deb`. The Filter uses the
+> `Executables` key (roothide/ElleKit honors `Executables`, **not**
+> `ExecutableNames`) targeting `keybagd`, so it only loads into that daemon.
 
 ## ⚠️ Caveat — do not use if you rely on backup
 

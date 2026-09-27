@@ -31,6 +31,21 @@
 #import <mach-o/dyld.h>
 #import <stdint.h>
 #import <string.h>
+#import <stdio.h>
+#import <unistd.h>
+#import <stdarg.h>
+
+// ---- diagnostic log (temporary, for on-device verification) -----------------
+// keybagd launches on demand and idle-exits, so this only appends a few lines
+// per day. It lets us confirm: (a) the dylib was loaded into keybagd, and
+// (b) whether the hook armed or the prologue guard bailed. Remove once verified.
+static void kcs_log(const char *fmt, ...) {
+    FILE *f = fopen("/tmp/keybagcacheskip.log", "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
 
 // Preferred (static) load address of drain_backup_keys in keybagd.
 static const uintptr_t kDrainBackupKeysStatic = 0x1000167cc;
@@ -53,6 +68,10 @@ static void *replacement_drain_backup_keys(void) {
 }
 
 %ctor {
+    char path[1024]; uint32_t psz = sizeof(path);
+    const char *exe = (_NSGetExecutablePath(path, &psz) == 0) ? path : "?";
+    kcs_log("ctor pid=%d exe=%s", getpid(), exe);
+
     uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
     void *target = (void *)(kDrainBackupKeysStatic + slide);
 
@@ -64,9 +83,12 @@ static void *replacement_drain_backup_keys(void) {
     memcpy(head, target, sizeof(head));
     if (memcmp(head, kDrainPrologue, 4) != 0) {
         // Mismatch -> do not hook. Leave keybagd untouched.
+        kcs_log("BAILED prologue mismatch target=%p bytes=%02x%02x%02x%02x",
+                target, head[0], head[1], head[2], head[3]);
         return;
     }
 
     MSHookFunction(target, (void *)replacement_drain_backup_keys,
                    (void **)&orig_drain_backup_keys);
+    kcs_log("HOOKED ok target=%p", target);
 }
