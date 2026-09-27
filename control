@@ -1,6 +1,6 @@
 Package: com.huhansibuxin.keybagcacheskip
 Name: KeybagCacheSkip
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64
 Description: Skip keybagd backup-keys cache rebuild (kills the ~306MB / ~20s CPU spike on cold boot)
 Maintainer: huhansibuxin

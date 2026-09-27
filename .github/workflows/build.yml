@@ -51,6 +51,20 @@ jobs:
       - name: Build
         run: make package
 
+      # 生死断言（2026-09-28 实机证明）：keybagd 里 libellekit/libsubstrate 加载不出来，
+      # 所以只要 dylib 的 LC_LOAD_DYLIB 里还有 substrate/ellekit，dlopen 就会静默失败，
+      # 插件完全不加载、一行日志都没有。构建产物一旦带上它，直接 fail，别浪费一次实机测试。
+      - name: Verify dylib has no substrate/ellekit dependency
+        run: |
+          DYLIB=$(find .theos -name 'KeybagCacheSkip.dylib' -type f | head -1)
+          echo "== $DYLIB =="
+          otool -L "$DYLIB"
+          if otool -L "$DYLIB" | grep -qiE 'substrate|ellekit'; then
+            echo "::error::KeybagCacheSkip.dylib still links substrate/ellekit -> dlopen() will fail in keybagd"
+            exit 1
+          fi
+          echo "OK: substrate-free"
+
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:

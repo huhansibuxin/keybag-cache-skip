@@ -1,1 +1,1 @@
-{ Filter = { Executables = ( "keybagd" ); Bundles = ( "com.apple.mobile.keybagd" ); }; }
+{ Filter = { Executables = ( "keybagd" ); }; }
