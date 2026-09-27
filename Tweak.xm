@@ -6,7 +6,7 @@
 // 306 MB). That pins CPU (~99%) for ~20-27 s per launch, and keybagd relaunches
 // often (RunAtLoad + machservice on demand + `-t 15` idle exit), so the spike
 // repeats. Visible in keybagd.log.0 as a recurring `db_check_once: ... is ok`
-// line ~22-27 s after each launch, and the sql3 file's mtime updates each launch.
+// line ~18-27 s after each launch, and the sql3 file's mtime/size update each launch.
 //
 // Fix: make @0x1000167cc return NULL immediately. Its caller does `cbz w0`, so
 // NULL makes keybagd skip storing a cache handle (the natural "no cache" state):
@@ -15,30 +15,30 @@
 // ---------------------------------------------------------------------------
 // v6 — WHY v1..v5 NEVER LOADED (root cause, proven on device 2026-09-28)
 // ---------------------------------------------------------------------------
-// The dylib was NEVER loaded into keybagd at all, so it could never log anything.
-// Proof: a crash report of keybagd (bug_type 309, `killall -ABRT keybagd`) lists
-// every non-shared-cache image in `usedImages`. Ours was absent, and so was
-// libellekit — while `   Choicy.dylib` was present.
+// The old dylib hard-linked LC_LOAD_DYLIB @loader_path/.jbroot/usr/lib/libsubstrate.dylib
+// (pulled in by MSHookFunction) and **libellekit cannot be loaded in keybagd**,
+// so dlopen() of our tweak FAILED silently -> zero logs, hook never ran.
+// Proof + controlled experiment: see git history. Fix = zero substrate symbols
+// (the LocalStorageSkip recipe) so the linker drops -lsubstrate.
 //
-// Mechanism: this JB (roothide/RootHide) injects the jailbreak base libs
-// (systemhook/roothideinit/roothidepatch/libroothide/forkfix) + the tweak manager
-// `   Choicy.dylib` into keybagd, but **libellekit.dylib
-// (= libsubstrate.dylib) cannot be loaded in keybagd**. Our old dylib hard-linked
-//   LC_LOAD_DYLIB @loader_path/.jbroot/usr/lib/libsubstrate.dylib
-// (pulled in by MSHookFunction), so `dlopen` of our tweak FAILED silently.
+// ---------------------------------------------------------------------------
+// v7 — WHY v6 LOADED BUT STILL DID NOT PATCH (proven on device 2026-09-28)
+// ---------------------------------------------------------------------------
+// v6 was loaded and its ctor ran (marker file appeared), but it bailed out:
+//     KCS-BOOT v6 pid=46229 img0=/usr/lib/systemhook-6E15938E68EC7D9F.dylib slide=0x103064000
+//     KCS-TARGET target=0x20307a7cc bytes=e20313aae30314aa prologue_match=0
+//     KCS-BAILED prologue mismatch
+// Cause: `_dyld_get_image_name(0)` is NOT the main executable in this
+// rootless/roothide jailbreak -- the injected `systemhook-<UUID>.dylib` occupies
+// image index 0. So `_dyld_get_image_vmaddr_slide(0)` is systemhook's ASLR slide,
+// not keybagd's -> target pointed into an unrelated mapping (sometimes a zero
+// page). The prologue guard correctly refused to write (no collateral damage),
+// hence the CPU spike and the rebuilt sql3 continued unchanged.
 //
-// Controlled experiment that nailed it: copied the substrate-free
-// LocalStorageSkip.dylib over ours (same name, same Filter, so Choicy's
-// allowedTweaks=["KeybagCacheSkip"] still matched) -> it was loaded into keybagd
-// instantly (appeared in usedImages). Only variable = the substrate dependency.
-// Same JB loads substrate-linked tweaks fine in other processes (mediaserverd
-// proved TrollOpenCamera/SneakyCam/SneakySupport + libellekit all load), so this
-// is specific to keybagd's dependency resolution.
-//
-// => The fix is the LocalStorageSkip recipe: reference ZERO substrate symbols so
-//    the linker drops `-lsubstrate`, and do the patch by hand with only libSystem.
-//    No MSHookFunction, no trampoline, no %hook. (Theos only emits the substrate
-//    LC_LOAD_DYLIB when a substrate symbol is actually used.)
+// Fix: locate the main executable by scanning dyld images for filetype ==
+// MH_EXECUTE (with a name contains "keybagd" fallback), take ITS slide, and only
+// then compute the target. v7 also dumps the full image list to the marker so a
+// failure is diagnosable in one round trip.
 //
 // Patching @0x1000167cc = overwrite the prologue with:
 //     mov x0, #0     (0xD2800000)   ; return NULL
@@ -55,20 +55,23 @@
 // ---------------------------------------------------------------------------
 
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <dlfcn.h>
 
 // ---- diagnostics ------------------------------------------------------------
 // Keep the channel set that keybagd itself provably writes, so a single file
 // presence answers "did the dylib load and did the ctor run?".
-// From our SSH view these are /rootfs/private/var/keybags/backup/... (the device
-// root is at /rootfs in the jailbreak shell; keybagd sees it as /).
+// NOTE: /var is a symlink to /private/var, so the two spellings are the SAME file
+// (that is why v6 logged everything twice). Deduplicated here.
+// From our SSH view these are /rootfs/private/var/... (device root == /rootfs).
 static void kcs_log(const char *fmt, ...) {
     char buf[768];
     va_list ap;
@@ -78,7 +81,6 @@ static void kcs_log(const char *fmt, ...) {
 
     static const char *paths[] = {
         "/private/var/keybags/backup/kcs_marker.txt",  // keybagd writes here every launch
-        "/var/keybags/backup/kcs_marker.txt",
         "/tmp/kcs_marker.txt",
         "/var/mobile/Library/Logs/kcs_marker.txt",
     };
@@ -91,6 +93,11 @@ static void kcs_log(const char *fmt, ...) {
     }
 }
 
+static void kcs_hex8(char *out, size_t n, const unsigned char *p) {
+    snprintf(out, n, "%02x%02x%02x%02x%02x%02x%02x%02x",
+             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+}
+
 // Preferred (static) load address of the cache function in keybagd.
 static const uintptr_t kCacheFnStatic = 0x1000167cc;
 
@@ -98,48 +105,85 @@ static const uintptr_t kCacheFnStatic = 0x1000167cc;
 // instruction word 0xD503237F -> little-endian bytes 7F 23 03 D5.
 static const unsigned char kCacheFnPrologue[4] = { 0x7f, 0x23, 0x03, 0xd5 };
 
-// mov x0, #0 ; ret   (little-endian byte order handled by uint32 stores)
+// mov x0, #0 ; ret
 static const uint32_t kPatch[2] = { 0xD2800000u, 0xD65F03C0u };
+
+#define KCS_MAXCAND 24
 
 static void kcs_bootstrap(void) {
     static int done = 0;
     if (done) return;
     done = 1;
 
-    char img0[256] = "?";
-    const char *n0 = _dyld_get_image_name(0);
-    if (n0) {
-        strncpy(img0, n0, sizeof(img0) - 1);
-        img0[sizeof(img0) - 1] = 0;
+    uint32_t nimg = _dyld_image_count();
+    kcs_log("KCS-BOOT v7 pid=%d dynimages=%u", getpid(), nimg);
+
+    // Dump the image table (so one round trip is enough to diagnose).
+    for (uint32_t i = 0; i < nimg && i < 24; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        const char *nm = _dyld_get_image_name(i);
+        kcs_log("KCS-IMG[%u] type=%u slide=%#lx name=%s",
+                i,
+                h ? (unsigned)h->filetype : 0u,
+                (unsigned long)_dyld_get_image_vmaddr_slide(i),
+                nm ? nm : "?");
     }
 
-    Dl_info dli;
-    memset(&dli, 0, sizeof(dli));
-    const char *self = (dladdr((void *)kcs_bootstrap, &dli) && dli.dli_fname) ? dli.dli_fname : "?";
+    // --- pick the main executable: filetype == MH_EXECUTE (fallback: name) ----
+    // In this JB the injected systemhook dylib owns image index 0, so we must NOT
+    // use index 0's slide. Prefer MH_EXECUTE; also collect any image whose
+    // basename is/contains "keybagd" as a fallback candidate.
+    uintptr_t cand[KCS_MAXCAND];
+    const char *candname[KCS_MAXCAND];
+    int nc = 0;
 
-    uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
-    unsigned char *target = (unsigned char *)(kCacheFnStatic + slide);
+    int midx = -1;
+    for (uint32_t i = 0; i < nimg; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (h && h->filetype == MH_EXECUTE) { midx = (int)i; break; }
+    }
+    if (midx >= 0) {
+        uintptr_t sl = (uintptr_t)_dyld_get_image_vmaddr_slide((uint32_t)midx);
+        const char *nm = _dyld_get_image_name((uint32_t)midx);
+        kcs_log("KCS-MAIN idx=%d slide=%#lx name=%s", midx, (unsigned long)sl, nm ? nm : "?");
+        cand[nc] = kCacheFnStatic + sl; candname[nc] = nm ? nm : "?"; nc++;
+    } else {
+        kcs_log("KCS-WARN no MH_EXECUTE image found");
+    }
 
-    unsigned char head[8];
-    memcpy(head, target, sizeof(head));
-    int match = (memcmp(head, kCacheFnPrologue, 4) == 0);
+    for (uint32_t i = 0; i < nimg && nc < KCS_MAXCAND; i++) {
+        if ((int)i == midx) continue;
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        if (!strstr(nm, "keybagd")) continue;
+        uintptr_t sl = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+        cand[nc] = kCacheFnStatic + sl; candname[nc] = nm; nc++;
+    }
 
-    kcs_log("KCS-BOOT v6 pid=%d img0=%s slide=%#lx tweakinject_visible=%d self=%s",
-            getpid(), img0, (unsigned long)slide,
-            access("/usr/lib/TweakInject/KeybagCacheSkip.dylib", F_OK) == 0, self);
-    kcs_log("KCS-TARGET target=%p bytes=%02x%02x%02x%02x%02x%02x%02x%02x prologue_match=%d",
-            target, head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
-            match);
+    // --- evaluate candidates; patch the first one whose prologue matches ------
+    unsigned char *hit = NULL;
+    const char *hitname = NULL;
+    for (int c = 0; c < nc; c++) {
+        unsigned char *t = (unsigned char *)cand[c];
+        unsigned char head[8];
+        char hx[24];
+        memcpy(head, t, sizeof(head));
+        kcs_hex8(hx, sizeof(hx), head);
+        int m = (memcmp(head, kCacheFnPrologue, 4) == 0);
+        kcs_log("KCS-CAND[%d] %p bytes=%s match=%d name=%s", c, (void *)t, hx, m, candname[c]);
+        if (m && !hit) { hit = t; hitname = candname[c]; }
+    }
 
-    if (!match) {
-        kcs_log("KCS-BAILED prologue mismatch -> not patching (keybagd differs from RE build)");
+    if (!hit) {
+        kcs_log("KCS-BAILED no candidate matched prologue (see KCS-IMG list)");
         return;
     }
+    kcs_log("KCS-HIT at %p via %s", (void *)hit, hitname ? hitname : "?");
 
     // Make the code page writable. VM_PROT_COPY gives us a COW private copy of
     // the signed __TEXT page, which is what every inline hooker does on iOS.
     long ps = getpagesize();
-    uintptr_t page = (uintptr_t)target & ~((uintptr_t)ps - 1);
+    uintptr_t page = (uintptr_t)hit & ~((uintptr_t)ps - 1);
     kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)ps, FALSE,
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
@@ -147,13 +191,14 @@ static void kcs_bootstrap(void) {
         return;
     }
 
-    memcpy(target, kPatch, sizeof(kPatch));
-    sys_icache_invalidate(target, sizeof(kPatch));
+    memcpy(hit, kPatch, sizeof(kPatch));
+    sys_icache_invalidate(hit, sizeof(kPatch));
 
     unsigned char after[8];
-    memcpy(after, target, sizeof(after));
-    kcs_log("KCS-PATCHED ok bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
-            after[0], after[1], after[2], after[3], after[4], after[5], after[6], after[7]);
+    char hxa[24];
+    memcpy(after, hit, sizeof(after));
+    kcs_hex8(hxa, sizeof(hxa), after);
+    kcs_log("KCS-PATCHED ok at %p bytes=%s", (void *)hit, hxa);
 }
 
 %ctor { kcs_bootstrap(); }
